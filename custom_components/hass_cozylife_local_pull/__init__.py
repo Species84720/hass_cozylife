@@ -2,22 +2,23 @@
 
 Supports both:
   • UI-based setup via config_flow (recommended)
-  • Legacy configuration.yaml entry for backward compatibility
+  • Legacy configuration.yaml for backward compatibility
+
+The key design principle: platform files (light.py / switch.py) are left
+completely untouched.  They only implement async_setup_platform, so we always
+drive them through async_load_platform regardless of whether the config came
+from a config entry or from YAML.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.discovery import async_load_platform
+import homeassistant.helpers.config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ DOMAIN = "hass_cozylife_local_pull"
 CONF_LANG = "lang"
 CONF_IPS = "ip"
 
-PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SWITCH]
+PLATFORMS = ["light", "switch"]
 
 # ── Schema for configuration.yaml (legacy) ──────────────────────────────────
 CONFIG_SCHEMA = vol.Schema(
@@ -42,9 +43,6 @@ CONFIG_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
-# ── Runtime storage key ──────────────────────────────────────────────────────
-COZYLIFE_DEVICES_KEY = f"{DOMAIN}_devices"
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Legacy setup (configuration.yaml)
@@ -53,31 +51,26 @@ COZYLIFE_DEVICES_KEY = f"{DOMAIN}_devices"
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up from configuration.yaml (legacy path).
 
-    When the user has BOTH a config entry AND a yaml block we skip yaml so
-    the config entry takes precedence and we don't load devices twice.
+    Skipped automatically when a config entry already exists so devices are
+    never loaded twice.
     """
     if DOMAIN not in config:
         return True
 
-    # Skip yaml setup if a config entry already exists for this domain.
     if hass.config_entries.async_entries(DOMAIN):
         _LOGGER.debug(
-            "CozyLife config entry exists – skipping configuration.yaml setup."
+            "CozyLife: config entry exists – skipping configuration.yaml setup"
         )
         return True
 
     conf = config[DOMAIN]
-    lang: str = conf.get(CONF_LANG, "en")
-    ip_list: list[str] = conf.get(CONF_IPS, [])
+    _store_runtime_config(hass, conf)
 
-    _LOGGER.info(
-        "CozyLife (yaml): lang=%s, devices=%s", lang, ip_list
-    )
-
-    await _async_init_devices(hass, lang, ip_list)
-
+    # Use the same platform-loading path the original integration used
     for platform in PLATFORMS:
-        await async_load_platform(hass, platform, DOMAIN, {}, config)
+        hass.async_create_task(
+            async_load_platform(hass, platform, DOMAIN, {}, config)
+        )
 
     return True
 
@@ -87,74 +80,55 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up CozyLife from a config entry (UI-based setup)."""
-    lang: str = entry.data.get(CONF_LANG, "en")
-    ip_list: list[str] = entry.data.get(CONF_IPS, [])
+    """Set up CozyLife from a UI config entry.
+
+    We deliberately call async_load_platform (not async_forward_entry_setups)
+    so that the existing light.py / switch.py async_setup_platform functions
+    work without any modification.
+    """
+    # Build a minimal config dict that looks like a yaml config to the platforms
+    domain_conf = {
+        CONF_LANG: entry.data.get(CONF_LANG, "en"),
+        CONF_IPS: entry.data.get(CONF_IPS, []),
+    }
+    fake_hass_config = {DOMAIN: domain_conf}
+
+    _store_runtime_config(hass, domain_conf)
 
     _LOGGER.info(
-        "CozyLife (config entry): lang=%s, devices=%s", lang, ip_list
+        "CozyLife (config entry): lang=%s, ips=%s",
+        domain_conf[CONF_LANG],
+        domain_conf[CONF_IPS],
     )
 
-    await _async_init_devices(hass, lang, ip_list)
+    for platform in PLATFORMS:
+        hass.async_create_task(
+            async_load_platform(hass, platform, DOMAIN, {}, fake_hass_config)
+        )
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Register listener so options-flow changes are applied on reload
+    # Re-apply options when the user edits them via Configure
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry and clean up device state."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        hass.data.pop(DOMAIN, None)
-    return unload_ok
+    """Clean up when a config entry is removed or reloaded."""
+    hass.data.pop(DOMAIN, None)
+    return True
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload entry when options are updated."""
+    """Reload the config entry when options are changed."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Shared initialisation helper
+# Shared helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _async_init_devices(
-    hass: HomeAssistant, lang: str, ip_list: list[str]
-) -> None:
-    """Discover / connect to CozyLife devices and store them in hass.data."""
-    from .cozylife_device import CozyLifeDevice  # local import to avoid circular
-
+def _store_runtime_config(hass: HomeAssistant, conf: dict) -> None:
+    """Store config in hass.data so platform files can read it if needed."""
     hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN]["lang"] = lang
-    hass.data[DOMAIN]["devices"] = []
-
-    if not ip_list:
-        # No explicit IPs → rely on UDP broadcast discovery (original behaviour)
-        _LOGGER.debug("CozyLife: no IPs provided, using UDP discovery")
-        return
-
-    connect_tasks = [
-        _async_connect_device(hass, ip, lang) for ip in ip_list
-    ]
-    await asyncio.gather(*connect_tasks, return_exceptions=True)
-
-
-async def _async_connect_device(
-    hass: HomeAssistant, ip: str, lang: str
-) -> None:
-    """Connect to a single device and register it."""
-    from .cozylife_device import CozyLifeDevice  # local import
-
-    try:
-        device = CozyLifeDevice(ip)
-        await hass.async_add_executor_job(device.query)
-        hass.data[DOMAIN]["devices"].append(device)
-        _LOGGER.debug("CozyLife: connected to device at %s", ip)
-    except Exception as exc:  # noqa: BLE001
-        _LOGGER.warning(
-            "CozyLife: could not connect to device at %s: %s", ip, exc
-        )
+    hass.data[DOMAIN][CONF_LANG] = conf.get(CONF_LANG, "en")
+    hass.data[DOMAIN][CONF_IPS] = conf.get(CONF_IPS, [])
