@@ -1,18 +1,22 @@
 """CozyLife energy sensor platform.
 
-Creates three sensor entities per device that exposes energy-monitoring dpids:
-  • dpid 18 → current  (mA raw  → A displayed,  divide by 1000)
-  • dpid 19 → power    (0.1 W   → W displayed,  divide by 10)
-  • dpid 20 → voltage  (0.1 V   → V displayed,  divide by 10)
+Energy dpids (18/19/20) only appear in the CMD_QUERY attr response when the
+plug is actively drawing power - so we can't rely on device.dpid being
+populated with those values at setup time.
 
-Entities are only registered when the device's dpid list actually includes the
-relevant dpid, so lights and basic switches are left untouched.
+Fix: create energy sensor entities for every switch-type device (anything
+without brightness dpid 4) unconditionally. update() will try to read the
+values and mark the entity unavailable if they're not in the response.
+
+dpid reference:
+  18 -> current  (raw mA,     divide by 1000 -> A)
+  19 -> power    (raw 0.1 W,  divide by 10   -> W)
+  20 -> voltage  (raw 0.1 V,  divide by 10   -> V)
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -34,13 +38,10 @@ _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "hass_cozylife_local_pull"
 
-# ── Sensor catalogue ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class CozyLifeSensorDescription(SensorEntityDescription):
-    """Extends SensorEntityDescription with CozyLife-specific fields."""
     dpid: int = 0
-    # Raw value from device → display value conversion
     scale: float = 1.0
 
 
@@ -52,7 +53,7 @@ SENSOR_DESCRIPTIONS: tuple[CozyLifeSensorDescription, ...] = (
         device_class=SensorDeviceClass.CURRENT,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
-        scale=0.001,          # raw mA → A
+        scale=0.001,
         icon="mdi:current-ac",
     ),
     CozyLifeSensorDescription(
@@ -62,7 +63,7 @@ SENSOR_DESCRIPTIONS: tuple[CozyLifeSensorDescription, ...] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfPower.WATT,
-        scale=0.1,            # raw 0.1 W units → W
+        scale=0.1,
         icon="mdi:flash",
     ),
     CozyLifeSensorDescription(
@@ -72,13 +73,11 @@ SENSOR_DESCRIPTIONS: tuple[CozyLifeSensorDescription, ...] = (
         device_class=SensorDeviceClass.VOLTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
-        scale=0.1,            # raw 0.1 V units → V
+        scale=0.1,
         icon="mdi:sine-wave",
     ),
 )
 
-
-# ── Platform setup ────────────────────────────────────────────────────────────
 
 async def async_setup_platform(
     hass: HomeAssistant,
@@ -86,7 +85,6 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: dict | None = None,
 ) -> None:
-    """Set up sensor entities from configuration.yaml (legacy path)."""
     _setup_sensors(hass, async_add_entities)
 
 
@@ -95,107 +93,108 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up sensor entities from a config entry (UI flow)."""
     _setup_sensors(hass, async_add_entities)
 
 
-def _setup_sensors(
-    hass: HomeAssistant,
-    async_add_entities: AddEntitiesCallback,
-) -> None:
-    """Create sensor entities for every device that supports energy dpids."""
+def _is_switch_device(device) -> bool:
+    """True for plugs/switches (no brightness dpid 4).
+
+    Same logic as switch.py so sensors only appear alongside switch entities.
+    """
+    dpids: list[int] = list(getattr(device, "dpid", None) or [])
+    if dpids:
+        return 4 not in dpids
+    # No dpid info yet - use model name heuristic
+    dmn: str = (getattr(device, "dmn", "") or "").lower()
+    if any(k in dmn for k in ("light", "bulb", "lamp", "strip", "led")):
+        return False
+    # Default: assume switch/plug and try energy sensors
+    return True
+
+
+def _setup_sensors(hass: HomeAssistant, async_add_entities: AddEntitiesCallback) -> None:
     devices: list = hass.data.get(DOMAIN, {}).get("devices", [])
+    if not devices:
+        _LOGGER.debug("CozyLife sensor: no devices in hass.data yet")
+        return
 
     entities: list[CozyLifeSensor] = []
     for device in devices:
-        device_dpids: list[int] = list(getattr(device, "dpid", []) or [])
-
+        if not _is_switch_device(device):
+            continue
+        # Always create all three energy sensors - update() will handle
+        # unavailability if the device doesn't support them
         for description in SENSOR_DESCRIPTIONS:
-            if description.dpid in device_dpids:
-                entities.append(CozyLifeSensor(device, description))
-                _LOGGER.debug(
-                    "CozyLife sensor: registering %s for device %s (dpid %d)",
-                    description.key,
-                    getattr(device, "ip", "?"),
-                    description.dpid,
-                )
+            entities.append(CozyLifeSensor(device, description))
+            _LOGGER.debug(
+                "CozyLife sensor: registering %s for %s",
+                description.key,
+                getattr(device, "ip", "?"),
+            )
 
     if entities:
         async_add_entities(entities, update_before_add=True)
     else:
-        _LOGGER.debug(
-            "CozyLife sensor: no energy-monitoring devices found "
-            "(dpids 18/19/20 not present in any device's dpid list)"
-        )
+        _LOGGER.debug("CozyLife sensor: no switch-type devices found")
 
-
-# ── Entity class ─────────────────────────────────────────────────────────────
 
 class CozyLifeSensor(SensorEntity):
-    """A single energy measurement sensor for one CozyLife device."""
+    """One energy sensor for a CozyLife plug."""
 
     entity_description: CozyLifeSensorDescription
 
     def __init__(self, device, description: CozyLifeSensorDescription) -> None:
         self._device = device
         self.entity_description = description
-
-        # Use device did if available, fall back to IP
         self._device_id: str = (
             getattr(device, "did", None) or getattr(device, "ip", "unknown")
         )
         self._attr_unique_id = f"{self._device_id}_{description.key}"
-        self._attr_name = (
-            f"{getattr(device, 'dmn', 'CozyLife')} {description.name}"
-        )
+        self._attr_name = f"{getattr(device, 'dmn', None) or 'CozyLife'} {description.name}"
         self._attr_native_value: float | None = None
+        self._attr_available: bool = True
 
     @property
     def device_info(self) -> DeviceInfo:
         return DeviceInfo(
             identifiers={(DOMAIN, self._device_id)},
-            name=getattr(self._device, "dmn", "CozyLife Device"),
+            name=getattr(self._device, "dmn", None) or "CozyLife Device",
             manufacturer="CozyLife",
             model=getattr(self._device, "pid", None),
         )
 
-    @property
-    def available(self) -> bool:
-        return getattr(self._device, "_tcp", None) is not None or getattr(
-            self._device, "available", True
-        )
-
     def update(self) -> None:
-        """Pull fresh state from the device (called in executor by HA)."""
+        """Poll state from device. Mark unavailable if dpid not in response."""
         try:
-            # query() refreshes self._device.state (the raw dpid dict)
-            state: dict = self._device.query() or {}
-            raw = state.get(str(self.entity_description.dpid))
-            if raw is None:
-                # Some firmware puts integer keys
-                raw = state.get(self.entity_description.dpid)
-
-            if raw is not None:
-                self._attr_native_value = round(
-                    float(raw) * self.entity_description.scale, 3
-                )
-                _LOGGER.debug(
-                    "CozyLife sensor %s: raw=%s → %s %s",
-                    self._attr_unique_id,
-                    raw,
-                    self._attr_native_value,
-                    self.entity_description.native_unit_of_measurement,
-                )
-            else:
-                _LOGGER.debug(
-                    "CozyLife sensor %s: dpid %d missing from state %s",
-                    self._attr_unique_id,
-                    self.entity_description.dpid,
-                    state,
-                )
-        except Exception as exc:  # noqa: BLE001
+            state: dict = self._device.query_cached() or {}
+        except Exception as exc:
             _LOGGER.warning(
-                "CozyLife sensor %s: update failed: %s",
-                self._attr_unique_id,
-                exc,
+                "CozyLife sensor %s: update error: %s", self._attr_unique_id, exc
             )
+            self._attr_available = False
+            return
+
+        dpid_key = str(self.entity_description.dpid)
+        raw = state.get(dpid_key)
+
+        if raw is None:
+            # dpid not in response - device may not support it or plug is idle
+            # Keep previous value but stay available so it updates when power flows
+            _LOGGER.debug(
+                "CozyLife sensor %s: dpid %s not in state %s",
+                self._attr_unique_id, dpid_key, state,
+            )
+            # Only set to None (unknown) if we've never had a value
+            if self._attr_native_value is None:
+                self._attr_available = False
+            return
+
+        self._attr_available = True
+        self._attr_native_value = round(float(raw) * self.entity_description.scale, 3)
+        _LOGGER.debug(
+            "CozyLife sensor %s: raw=%s -> %s %s",
+            self._attr_unique_id,
+            raw,
+            self._attr_native_value,
+            self.entity_description.native_unit_of_measurement,
+        )

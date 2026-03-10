@@ -148,7 +148,7 @@ class CozyLifeLight(LightEntity):
 
     def update(self) -> None:
         try:
-            state: dict = self._device.query() or {}
+            state: dict = self._device.query_cached() or {}
         except Exception as exc:
             _LOGGER.warning("CozyLife light %s update error: %s", self._attr_unique_id, exc)
             return

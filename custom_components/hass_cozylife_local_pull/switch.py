@@ -83,7 +83,7 @@ class CozyLifeSwitch(SwitchEntity):
 
     def update(self) -> None:
         try:
-            state: dict = self._device.query() or {}
+            state: dict = self._device.query_cached() or {}
             raw = state.get(_DP_SWITCH)
             if raw is not None:
                 # Device returns 0/1 integers, not booleans

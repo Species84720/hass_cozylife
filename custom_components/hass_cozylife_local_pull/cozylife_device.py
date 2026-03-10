@@ -263,3 +263,24 @@ class CozyLifeDevice:
                 )
         except Exception as exc:
             _LOGGER.debug("CozyLife %s: _fetch_info failed: %s", self.ip, exc)
+
+
+    # ------------------------------------------------------------------
+    # Cached query - prevents 4x TCP round-trips per HA poll cycle
+    # ------------------------------------------------------------------
+
+    _CACHE_TTL = 8  # seconds - HA polls every 30s by default, keep fresh
+
+    def query_cached(self) -> dict[str, Any]:
+        """Return state from cache if fresh, otherwise call query().
+
+        Multiple entities (switch + 3 sensors) all call this per poll cycle.
+        Only the first call within _CACHE_TTL seconds hits the device.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_cache_time", 0.0)
+        if now - last < self._CACHE_TTL and self._state:
+            return dict(self._state)
+        result = self.query()
+        self._cache_time = time.monotonic()
+        return result
