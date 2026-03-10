@@ -1,20 +1,21 @@
 """CozyLife local TCP device driver.
 
-Based on the original tcp_client.py protocol, corrected for HA integration use.
-
-Real protocol (from tcp_client.py source):
+Protocol (from tcp_client.py source):
   CMD_INFO  = 0  ->  {"cmd":0,"pv":0,"sn":"...","msg":{}}
-                     response: {"msg":{"did":"...","pid":"...","mac":"...","ip":"..."},"res":0}
-
   CMD_QUERY = 2  ->  {"cmd":2,"pv":0,"sn":"...","msg":{"attr":[0]}}
-                     response: {"msg":{"attr":[1,2,3,4,5,6],"data":{"1":0,"3":1000,"4":1000,...}},"res":0}
+  CMD_SET   = 3  ->  {"cmd":3,"pv":0,"sn":"...","msg":{"attr":[1],"data":{"1":1}}}
 
-  CMD_SET   = 3  ->  {"cmd":3,"pv":0,"sn":"...","msg":{"attr":[1],"data":{"1":0}}}
-                     response: {"msg":{"attr":[1],"data":{"1":0}},"res":0}
+Terminator: \\r\\n
+State lives in msg["data"].
+dpid list from "attr" array in CMD_QUERY response.
+On/off: integer 1/0.
 
-Packet terminator is \\r\\n (NOT \\n).
-State lives in msg["data"] (NOT msg["dps"]).
-dpid list comes from the "attr" array in a CMD_QUERY response.
+IMPORTANT - device behaviour:
+  - On connect it immediately pushes a cmd=10 unsolicited state packet.
+  - Every query response is followed by another unsolicited push with a
+    different sn.
+  - _recv_lines() drains all pending data and returns a list of parsed
+    dicts so callers can filter by sn.
 """
 from __future__ import annotations
 
@@ -27,11 +28,12 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-_PORT = 5555
-_CONNECT_TIMEOUT = 5   # seconds
-_RECV_TIMEOUT = 5      # seconds
-_RECV_SIZE = 4096
-_RECONNECT_DELAY = 30  # seconds between reconnect attempts
+_PORT             = 5555
+_CONNECT_TIMEOUT  = 5    # seconds
+_RECV_TIMEOUT     = 3    # seconds per recv call
+_RECV_SIZE        = 4096
+_CACHE_TTL        = 8    # seconds
+
 
 CMD_INFO  = 0
 CMD_QUERY = 2
@@ -47,78 +49,63 @@ class CozyLifeDevice:
 
     def __init__(self, ip: str) -> None:
         self.ip: str = ip
-
-        # Populated after first successful CMD_INFO + CMD_QUERY
         self.did: str = ""
         self.pid: str = ""
-        self.dmn: str = ""        # model name (from cloud API or fallback)
-        self.dpid: list[int] = [] # populated from CMD_QUERY attr list
+        self.dmn: str = ""
+        self.dpid: list[int] = []
 
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
         self._state: dict[str, Any] = {}
+        self._cache_time: float = 0.0
 
     # ------------------------------------------------------------------
-    # Public API (called from HA executor thread)
+    # Public API
     # ------------------------------------------------------------------
 
     def query(self) -> dict[str, Any]:
-        """Return current device state as a dict of string-keyed dpid values.
-
-        e.g. {"1": True, "3": 500, "4": 800, "18": 102, "19": 450, "20": 2301}
-
-        Also populates self.dpid from the response attr list on first call,
-        and self.did / self.pid from CMD_INFO if not already set.
-        """
         with self._lock:
             self._ensure_connected()
             if self._sock is None:
                 return dict(self._state)
 
-            # Get device identity on first connect
             if not self.did:
                 self._fetch_info()
 
             data = self._send_recv(CMD_QUERY, {"attr": [0]})
             if data is not None:
                 self._state = data
-                _LOGGER.debug("CozyLife %s state: %s", self.ip, data)
             return dict(self._state)
 
+    def query_cached(self) -> dict[str, Any]:
+        now = time.monotonic()
+        if now - self._cache_time < _CACHE_TTL and self._state:
+            return dict(self._state)
+        result = self.query()
+        self._cache_time = time.monotonic()
+        return result
+
     def apply_state(self, dp: dict) -> None:
-        """Send a CMD_SET command.
-
-        Args:
-            dp: {dpid_str_or_int: value} e.g. {"1": True} or {1: True}
-        """
-        # Keys must be strings in the packet, and attr list needs int keys
-        str_dp = {str(k): v for k, v in dp.items()}
+        str_dp   = {str(k): v for k, v in dp.items()}
         int_keys = [int(k) for k in str_dp]
-
         with self._lock:
             self._ensure_connected()
             if self._sock is None:
-                _LOGGER.warning("CozyLife %s: no connection, cannot set state", self.ip)
+                _LOGGER.warning("CozyLife %s: no connection for set", self.ip)
                 return
-
-            msg = {"attr": int_keys, "data": str_dp}
-            # Fire-and-forget (same as original _only_send for control)
             try:
-                self._send(CMD_SET, msg)
-                # Optimistic local update
+                self._send(CMD_SET, {"attr": int_keys, "data": str_dp})
                 self._state.update(str_dp)
-                _LOGGER.debug("CozyLife %s: set %s", self.ip, str_dp)
             except Exception as exc:
-                _LOGGER.warning("CozyLife %s: apply_state failed: %s", self.ip, exc)
+                _LOGGER.warning("CozyLife %s: apply_state error: %s", self.ip, exc)
                 self._disconnect()
                 raise
 
     # ------------------------------------------------------------------
-    # Connection management
+    # Connection
     # ------------------------------------------------------------------
 
     def _ensure_connected(self) -> None:
-        """Open a new TCP connection if not already connected."""
         if self._sock is not None:
             return
         try:
@@ -128,6 +115,9 @@ class CozyLifeDevice:
             s.settimeout(_RECV_TIMEOUT)
             self._sock = s
             _LOGGER.debug("CozyLife %s: connected", self.ip)
+            # Device pushes an unsolicited cmd=10 state packet immediately on
+            # connect. Drain it so it doesn't corrupt subsequent recv buffers.
+            self._drain()
         except Exception as exc:
             _LOGGER.debug("CozyLife %s: connect failed: %s", self.ip, exc)
             self._sock = None
@@ -140,44 +130,64 @@ class CozyLifeDevice:
                 pass
             self._sock = None
 
+    def _drain(self) -> None:
+        """Read and discard any data already waiting in the socket buffer.
+
+        Called once after connect to consume the initial cmd=10 push.
+        We also parse any cmd=10 data and seed self._state from it so the
+        first query_cached() call already has values.
+        """
+        self._sock.settimeout(0.5)
+        try:
+            raw = self._sock.recv(_RECV_SIZE)
+            for pkt in self._split_packets(raw):
+                msg = pkt.get("msg", {})
+                data = msg.get("data") if isinstance(msg, dict) else None
+                if isinstance(data, dict) and data:
+                    self._state = data
+                    attr = msg.get("attr")
+                    if isinstance(attr, list):
+                        self.dpid = [int(a) for a in attr if a != 0]
+                    _LOGGER.debug(
+                        "CozyLife %s: seeded state from initial push: %s",
+                        self.ip, data,
+                    )
+        except socket.timeout:
+            pass
+        except Exception as exc:
+            _LOGGER.debug("CozyLife %s: drain error: %s", self.ip, exc)
+        finally:
+            self._sock.settimeout(_RECV_TIMEOUT)
+
     # ------------------------------------------------------------------
     # Protocol helpers
     # ------------------------------------------------------------------
 
-    def _build_packet(self, cmd: int, msg: dict) -> bytes:
-        payload = json.dumps(
-            {"pv": 0, "cmd": cmd, "sn": _get_sn(), "msg": msg},
-            separators=(",", ":"),
-        )
-        # Original uses \r\n as terminator
-        return (payload + "\r\n").encode("utf-8")
+    @staticmethod
+    def _split_packets(raw: bytes) -> list[dict]:
+        """Split a recv buffer that may contain multiple \\r\\n-terminated
+        JSON packets and return all successfully parsed dicts."""
+        results = []
+        for line in raw.replace(b"\r\n", b"\n").split(b"\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return results
 
     def _send(self, cmd: int, msg: dict) -> None:
-        """Send a packet. Raises on socket error."""
-        self._sock.sendall(self._build_packet(cmd, msg))
-
-    def _recv(self) -> dict | None:
-        """Read one JSON response from the socket. Returns parsed dict or None."""
-        buf = b""
-        deadline = time.monotonic() + _RECV_TIMEOUT
-        while time.monotonic() < deadline:
-            try:
-                chunk = self._sock.recv(_RECV_SIZE)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            text = buf.decode("utf-8", errors="replace").strip()
-            if text:
-                try:
-                    return json.loads(text)
-                except json.JSONDecodeError:
-                    pass  # incomplete – keep reading
-        return None
+        sn = _get_sn()
+        packet = json.dumps(
+            {"pv": 0, "cmd": cmd, "sn": sn, "msg": msg},
+            separators=(",", ":"),
+        ) + "\r\n"
+        self._sock.sendall(packet.encode("utf-8"))
 
     def _send_recv(self, cmd: int, msg: dict) -> dict[str, Any] | None:
-        """Send a command and return msg["data"] from the response, or None."""
+        """Send a command and return msg["data"] from the matching response."""
         sn = _get_sn()
         packet = json.dumps(
             {"pv": 0, "cmd": cmd, "sn": sn, "msg": msg},
@@ -191,96 +201,83 @@ class CozyLifeDevice:
             self._disconnect()
             return None
 
-        # Read responses until we find one matching our sn
-        # (device may push unsolicited cmd=10 updates)
-        for _ in range(10):
+        # Read up to 3 recv() calls — response may arrive in multiple chunks
+        # and there will be at least one unsolicited push alongside it.
+        buf = b""
+        for _ in range(3):
             try:
-                raw = self._sock.recv(_RECV_SIZE)
+                chunk = self._sock.recv(_RECV_SIZE)
+                if not chunk:
+                    self._disconnect()
+                    break
+                buf += chunk
             except socket.timeout:
                 break
             except Exception as exc:
                 _LOGGER.debug("CozyLife %s: recv error: %s", self.ip, exc)
                 self._disconnect()
-                return None
+                break
 
-            if not raw:
-                self._disconnect()
-                return None
+        for pkt in self._split_packets(buf):
+            # Accept packet if sn matches OR if it contains our data
+            # (some firmware echoes with a new sn)
+            resp_msg = pkt.get("msg", {})
+            if not isinstance(resp_msg, dict):
+                continue
 
-            # Responses may be concatenated; split on \r\n or \n
-            for line in raw.replace(b"\r\n", b"\n").split(b"\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    resp = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            data = resp_msg.get("data")
+            if not isinstance(data, dict):
+                continue
 
-                resp_sn = resp.get("sn", "")
-                resp_msg = resp.get("msg", {})
+            # Update dpid list if attr present
+            attr = resp_msg.get("attr")
+            if isinstance(attr, list) and attr:
+                self.dpid = [int(a) for a in attr if a != 0]
 
-                if resp_sn != sn:
-                    continue  # unsolicited push, ignore
+            # Prefer the packet whose sn matches ours
+            if pkt.get("sn") == sn:
+                _LOGGER.debug("CozyLife %s: matched sn, data=%s", self.ip, data)
+                return data
 
-                if not isinstance(resp_msg, dict):
-                    return {}
-
-                # Extract data dict
+        # No sn match - return data from any packet that had a data dict
+        # (handles firmware that ignores our sn)
+        for pkt in self._split_packets(buf):
+            resp_msg = pkt.get("msg", {})
+            if isinstance(resp_msg, dict):
                 data = resp_msg.get("data")
-                if isinstance(data, dict):
-                    # Also capture dpid list from attr if present
-                    attr = resp_msg.get("attr")
-                    if isinstance(attr, list) and attr:
-                        self.dpid = [int(a) for a in attr if a != 0]
+                if isinstance(data, dict) and data:
+                    _LOGGER.debug("CozyLife %s: no sn match, fallback data=%s", self.ip, data)
                     return data
 
-                return {}
-
+        _LOGGER.debug("CozyLife %s: no data in buf: %s", self.ip, buf)
         return None
 
     def _fetch_info(self) -> None:
-        """Send CMD_INFO and populate did/pid from response."""
+        """Send CMD_INFO to populate did/pid. Uses line-by-line parsing."""
         sn = _get_sn()
         packet = json.dumps(
             {"pv": 0, "cmd": CMD_INFO, "sn": sn, "msg": {}},
             separators=(",", ":"),
         ) + "\r\n"
-
         try:
             self._sock.sendall(packet.encode("utf-8"))
             raw = self._sock.recv(_RECV_SIZE)
-            resp = json.loads(raw.strip())
-            msg = resp.get("msg", {})
-            if isinstance(msg, dict):
-                self.did = msg.get("did", "") or ""
-                self.pid = msg.get("pid", "") or ""
-                # dmn not in CMD_INFO response - use pid as fallback
-                if not self.dmn:
+            for pkt in self._split_packets(raw):
+                msg = pkt.get("msg", {})
+                if not isinstance(msg, dict):
+                    continue
+                did = msg.get("did", "")
+                if did:
+                    self.did = did
+                    self.pid = msg.get("pid", "") or ""
                     self.dmn = msg.get("dmn", "") or f"CozyLife {self.pid or self.ip}"
-                _LOGGER.info(
-                    "CozyLife %s: did=%s pid=%s", self.ip, self.did, self.pid
-                )
+                    _LOGGER.info(
+                        "CozyLife %s: did=%s pid=%s", self.ip, self.did, self.pid
+                    )
+                    return
         except Exception as exc:
-            _LOGGER.debug("CozyLife %s: _fetch_info failed: %s", self.ip, exc)
-
-
-    # ------------------------------------------------------------------
-    # Cached query - prevents 4x TCP round-trips per HA poll cycle
-    # ------------------------------------------------------------------
-
-    _CACHE_TTL = 8  # seconds - HA polls every 30s by default, keep fresh
-
-    def query_cached(self) -> dict[str, Any]:
-        """Return state from cache if fresh, otherwise call query().
-
-        Multiple entities (switch + 3 sensors) all call this per poll cycle.
-        Only the first call within _CACHE_TTL seconds hits the device.
-        """
-        now = time.monotonic()
-        last = getattr(self, "_cache_time", 0.0)
-        if now - last < self._CACHE_TTL and self._state:
-            return dict(self._state)
-        result = self.query()
-        self._cache_time = time.monotonic()
-        return result
+            _LOGGER.debug("CozyLife %s: _fetch_info error: %s", self.ip, exc)
+        # Fallback so we don't retry on every query() call
+        if not self.did:
+            self.did = self.ip
+            self.dmn = f"CozyLife {self.ip}"
