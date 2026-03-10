@@ -1,13 +1,11 @@
 """CozyLife Local Pull integration.
 
 Supports both:
-  • UI-based setup via config_flow (recommended, shows entities under the
-    integration card and supports the options flow)
-  • Legacy configuration.yaml for backward compatibility
+  - UI-based setup via config_flow (recommended)
+  - Legacy configuration.yaml for backward compatibility
 
-Entity-to-config-entry linking is achieved by using
-async_forward_entry_setups, which requires async_setup_entry to be present
-in light.py and switch.py (provided as patches alongside this file).
+Uses async_forward_entry_setups so entities (light, switch, sensor) are all
+properly linked to the config entry and appear under the integration card.
 """
 from __future__ import annotations
 
@@ -27,9 +25,8 @@ DOMAIN = "hass_cozylife_local_pull"
 CONF_LANG = "lang"
 CONF_IPS = "ip"
 
-PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SWITCH]
+PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR]
 
-# ── Schema for configuration.yaml (legacy) ──────────────────────────────────
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
@@ -45,9 +42,9 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Legacy setup (configuration.yaml)
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up from configuration.yaml (legacy path).
@@ -60,7 +57,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     if hass.config_entries.async_entries(DOMAIN):
         _LOGGER.debug(
-            "CozyLife: config entry exists – skipping configuration.yaml setup"
+            "CozyLife: config entry exists - skipping configuration.yaml setup"
         )
         return True
 
@@ -75,16 +72,15 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Config-entry setup (UI flow)
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up CozyLife from a UI config entry.
 
-    Stores config in hass.data so the platform async_setup_entry functions
-    (in light.py and switch.py) can read it, then forwards to those platforms
-    so all entities are properly linked to this config entry.
+    Stores config in hass.data and forwards to all platform files via
+    async_forward_entry_setups so every entity is linked to this entry.
     """
     _store_runtime_config(hass, entry.data)
 
@@ -94,8 +90,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data.get(CONF_IPS, []),
     )
 
-    # async_forward_entry_setups links entities to this config entry so they
-    # appear under Settings → Devices & Services → CozyLife card.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -115,12 +109,20 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Shared helpers
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 def _store_runtime_config(hass: HomeAssistant, data: dict) -> None:
-    """Write lang + ip list into hass.data[DOMAIN] for platform files to read."""
+    """Write config into hass.data[DOMAIN] for all platform files to read.
+
+    Ensures the 'devices' list key always exists so sensor.py can safely
+    iterate it. switch.py and light.py append CozyLifeDevice instances to
+    hass.data[DOMAIN]['devices'] during their async_setup_platform calls;
+    sensor.py reads from that list to find energy-monitoring devices.
+    """
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][CONF_LANG] = data.get(CONF_LANG, "en")
     hass.data[DOMAIN][CONF_IPS] = data.get(CONF_IPS, [])
+    # Preserve existing device list if platforms already populated it
+    hass.data[DOMAIN].setdefault("devices", [])
