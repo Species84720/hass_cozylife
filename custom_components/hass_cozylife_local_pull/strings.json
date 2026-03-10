@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up CozyLife devices",
+        "description": "Enter the IP address(es) of your CozyLife device(s). You can add multiple IPs, one per line or comma-separated.\n\nExample:\n{example}",
+        "data": {
+          "ip_input": "Device IP address(es)",
+          "lang": "Language"
+        },
+        "data_description": {
+          "ip_input": "One IP per line, or comma-separated. Example: 192.168.1.10",
+          "lang": "Language used for device labels (en or zh)"
+        }
+      }
+    },
+    "error": {
+      "no_devices_found": "No CozyLife devices responded at the given IP(s). Check that the devices are powered on and reachable on your network.",
+      "invalid_ip": "One or more IP addresses are not valid."
+    },
+    "abort": {
+      "already_configured": "This set of CozyLife devices is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "CozyLife options",
+        "description": "Update the IP address(es) of your CozyLife device(s). One IP per line or comma-separated.\n\nExample:\n{example}",
+        "data": {
+          "ip_input": "Device IP address(es)",
+          "lang": "Language"
+        },
+        "data_description": {
+          "ip_input": "One IP per line, or comma-separated.",
+          "lang": "Language used for device labels (en or zh)"
+        }
+      }
+    },
+    "error": {
+      "no_devices_found": "No CozyLife devices responded at the given IP(s). Check that the devices are powered on and reachable on your network.",
+      "invalid_ip": "One or more IP addresses are not valid."
+    }
+  }
+}
