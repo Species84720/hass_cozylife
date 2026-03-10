@@ -6,6 +6,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.config_entries import ConfigEntry
 from typing import Any, Final, Literal, TypedDict, final
 from .const import (
     DOMAIN,
@@ -103,3 +104,14 @@ class CozyLifeSwitch(SwitchEntity):
         return None
         
         raise NotImplementedError()
+
+_SWITCH_PATCH_DOMAIN = "hass_cozylife_local_pull"
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Config-entry bridge: reads stored config and delegates to async_setup_platform."""
+    config = hass.data.get(_SWITCH_PATCH_DOMAIN, {})
+    await async_setup_platform(hass, config, async_add_entities, discovery_info=None)

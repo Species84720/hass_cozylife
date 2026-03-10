@@ -1,13 +1,13 @@
 """CozyLife Local Pull integration.
 
 Supports both:
-  • UI-based setup via config_flow (recommended)
+  • UI-based setup via config_flow (recommended, shows entities under the
+    integration card and supports the options flow)
   • Legacy configuration.yaml for backward compatibility
 
-The key design principle: platform files (light.py / switch.py) are left
-completely untouched.  They only implement async_setup_platform, so we always
-drive them through async_load_platform regardless of whether the config came
-from a config entry or from YAML.
+Entity-to-config-entry linking is achieved by using
+async_forward_entry_setups, which requires async_setup_entry to be present
+in light.py and switch.py (provided as patches alongside this file).
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import logging
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.discovery import async_load_platform
 import homeassistant.helpers.config_validation as cv
@@ -26,7 +27,7 @@ DOMAIN = "hass_cozylife_local_pull"
 CONF_LANG = "lang"
 CONF_IPS = "ip"
 
-PLATFORMS = ["light", "switch"]
+PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SWITCH]
 
 # ── Schema for configuration.yaml (legacy) ──────────────────────────────────
 CONFIG_SCHEMA = vol.Schema(
@@ -66,7 +67,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     conf = config[DOMAIN]
     _store_runtime_config(hass, conf)
 
-    # Use the same platform-loading path the original integration used
     for platform in PLATFORMS:
         hass.async_create_task(
             async_load_platform(hass, platform, DOMAIN, {}, config)
@@ -82,44 +82,36 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up CozyLife from a UI config entry.
 
-    We deliberately call async_load_platform (not async_forward_entry_setups)
-    so that the existing light.py / switch.py async_setup_platform functions
-    work without any modification.
+    Stores config in hass.data so the platform async_setup_entry functions
+    (in light.py and switch.py) can read it, then forwards to those platforms
+    so all entities are properly linked to this config entry.
     """
-    # Build a minimal config dict that looks like a yaml config to the platforms
-    domain_conf = {
-        CONF_LANG: entry.data.get(CONF_LANG, "en"),
-        CONF_IPS: entry.data.get(CONF_IPS, []),
-    }
-    fake_hass_config = {DOMAIN: domain_conf}
-
-    _store_runtime_config(hass, domain_conf)
+    _store_runtime_config(hass, entry.data)
 
     _LOGGER.info(
         "CozyLife (config entry): lang=%s, ips=%s",
-        domain_conf[CONF_LANG],
-        domain_conf[CONF_IPS],
+        entry.data.get(CONF_LANG, "en"),
+        entry.data.get(CONF_IPS, []),
     )
 
-    for platform in PLATFORMS:
-        hass.async_create_task(
-            async_load_platform(hass, platform, DOMAIN, {}, fake_hass_config)
-        )
+    # async_forward_entry_setups links entities to this config entry so they
+    # appear under Settings → Devices & Services → CozyLife card.
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Re-apply options when the user edits them via Configure
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Clean up when a config entry is removed or reloaded."""
-    hass.data.pop(DOMAIN, None)
-    return True
+    """Unload all platforms and clean up runtime state."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        hass.data.pop(DOMAIN, None)
+    return unload_ok
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the config entry when options are changed."""
+    """Reload the integration when options are saved."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -127,8 +119,8 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 # Shared helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _store_runtime_config(hass: HomeAssistant, conf: dict) -> None:
-    """Store config in hass.data so platform files can read it if needed."""
+def _store_runtime_config(hass: HomeAssistant, data: dict) -> None:
+    """Write lang + ip list into hass.data[DOMAIN] for platform files to read."""
     hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][CONF_LANG] = conf.get(CONF_LANG, "en")
-    hass.data[DOMAIN][CONF_IPS] = conf.get(CONF_IPS, [])
+    hass.data[DOMAIN][CONF_LANG] = data.get(CONF_LANG, "en")
+    hass.data[DOMAIN][CONF_IPS] = data.get(CONF_IPS, [])

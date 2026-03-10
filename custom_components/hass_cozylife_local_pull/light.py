@@ -30,6 +30,7 @@ from homeassistant.components.light import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.config_entries import ConfigEntry
 from typing import Any, Final, Literal, TypedDict, final
 from .const import (
     DOMAIN,
@@ -230,3 +231,23 @@ class CozyLifeLight(LightEntity):
     #     """Set bulb's color."""
     #     _LOGGER.info('set_hs')
     #     self._attr_hs_color = (hs_color[0], hs_color[1])
+
+# DOMAIN / CONF_* are already imported/defined at the top of light.py;
+# re-import here only so this snippet is self-contained for reference.
+_LIGHT_PATCH_DOMAIN = "hass_cozylife_local_pull"
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Config-entry bridge: reads stored config and delegates to async_setup_platform.
+
+    hass.data[DOMAIN] is populated by __init__.async_setup_entry before HA
+    calls this function, so all the device info is already available.
+    """
+    config = hass.data.get(_LIGHT_PATCH_DOMAIN, {})
+    # async_setup_platform expects the platform config dict as second argument.
+    # Pass an empty dict – the function reads from hass.data directly.
+    await async_setup_platform(hass, config, async_add_entities, discovery_info=None)
