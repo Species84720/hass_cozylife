@@ -1,18 +1,16 @@
-"""CozyLife light platform - fully migrated to HA 2026.3 API.
+"""CozyLife light platform - HA 2026.3 API, correct CozyLife protocol.
 
-Replaces the original light.py entirely. Key changes:
-  - ATTR_COLOR_TEMP / min_mireds / max_mireds  ->  ATTR_COLOR_TEMP_KELVIN /
-    min_color_temp_kelvin / max_color_temp_kelvin
-  - COLOR_MODE_* strings  ->  ColorMode enum
-  - SUPPORT_* flags  ->  supported_color_modes set (now mandatory)
-  - async_setup_entry added so entities link to the config entry card
+Protocol note: device returns/expects integer values, not booleans.
+State lives in msg["data"] with string keys: {"1":1, "3":500, "4":800, ...}
+dpid list is populated from the "attr" array in CMD_QUERY response.
 
 CozyLife dpid reference:
-  1 : on/off    bool
-  3 : color temp  int 0-1000  (0=warm ~2700K, 1000=cool ~6500K)
-  4 : brightness  int 0-1000
-  5 : hue         int 0-360
-  6 : saturation  int 0-1000
+  "1" : on/off       0 or 1
+  "2" : work mode    0=normal, 1=effect
+  "3" : color temp   int 0-1000  (0=warm ~2700K, 1000=cool ~6500K)
+  "4" : brightness   int 0-1000
+  "5" : hue          int 0-360
+  "6" : saturation   int 0-1000
 """
 from __future__ import annotations
 
@@ -47,17 +45,12 @@ _DP_HUE    = "5"
 _DP_SAT    = "6"
 
 
-# ---------------------------------------------------------------------------
-# Platform setup
-# ---------------------------------------------------------------------------
-
 async def async_setup_platform(
     hass: HomeAssistant,
     config: dict,
     async_add_entities: AddEntitiesCallback,
     discovery_info: dict | None = None,
 ) -> None:
-    """Legacy yaml setup."""
     _setup_lights(hass, async_add_entities)
 
 
@@ -66,31 +59,15 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Config-entry setup - links entities to the integration card."""
     _setup_lights(hass, async_add_entities)
 
 
 def _is_light(device) -> bool:
-    """Return True if this device should be handled as a light.
-
-    A device is a light when:
-      - its dpid list contains 4 (brightness), OR
-      - dpid info is unavailable but the device model name suggests a light
-
-    Falls back to True if we have absolutely no type info, letting the
-    entity be registered and leaving it up to update() to figure out state.
-    """
     dpids: list[int] = list(getattr(device, "dpid", None) or [])
     if dpids:
-        # Brightness dpid present  ->  light
-        # No brightness but has on/off only  ->  switch (handled by switch.py)
         return 4 in dpids
-    # No dpid info yet; use model name heuristic
     dmn: str = (getattr(device, "dmn", "") or "").lower()
-    if any(k in dmn for k in ("light", "bulb", "lamp", "strip", "led")):
-        return True
-    # Unknown - default to switch.py handling to avoid duplicate entities
-    return False
+    return any(k in dmn for k in ("light", "bulb", "lamp", "strip", "led"))
 
 
 def _setup_lights(hass: HomeAssistant, async_add_entities: AddEntitiesCallback) -> None:
@@ -98,16 +75,11 @@ def _setup_lights(hass: HomeAssistant, async_add_entities: AddEntitiesCallback) 
     if not devices:
         _LOGGER.debug("CozyLife light: no devices in hass.data yet")
         return
-
     entities = [CozyLifeLight(d) for d in devices if _is_light(d)]
     _LOGGER.debug("CozyLife light: registering %d entity/entities", len(entities))
     if entities:
         async_add_entities(entities, update_before_add=True)
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _ct_raw_to_kelvin(raw: int) -> int:
     raw = max(0, min(_CT_RAW_MAX, raw))
@@ -127,10 +99,6 @@ def _br_raw_to_ha(v: int) -> int:
     return round(v / _BR_RAW_MAX * 255)
 
 
-# ---------------------------------------------------------------------------
-# Entity
-# ---------------------------------------------------------------------------
-
 class CozyLifeLight(LightEntity):
     """One CozyLife light (RGBCW or CW)."""
 
@@ -144,7 +112,6 @@ class CozyLifeLight(LightEntity):
         self._attr_unique_id = self._device_id
         self._attr_name = getattr(device, "dmn", None) or "CozyLife Light"
 
-        # Supported color modes from dpid list (or defaults for unknown devices)
         modes: set[ColorMode] = set()
         if not dpids or (5 in dpids and 6 in dpids):
             modes.add(ColorMode.HS)
@@ -152,7 +119,6 @@ class CozyLifeLight(LightEntity):
             modes.add(ColorMode.COLOR_TEMP)
         if not modes or 4 in dpids:
             modes.add(ColorMode.BRIGHTNESS)
-        # Every light must declare at least one mode
         if not modes:
             modes.add(ColorMode.ONOFF)
         self._attr_supported_color_modes = modes
@@ -189,7 +155,7 @@ class CozyLifeLight(LightEntity):
 
         raw_on = state.get(_DP_SWITCH)
         if raw_on is not None:
-            self._attr_is_on = bool(raw_on)
+            self._attr_is_on = bool(int(raw_on))
 
         raw_bright = state.get(_DP_BRIGHT)
         if raw_bright is not None:
@@ -204,7 +170,6 @@ class CozyLifeLight(LightEntity):
         if raw_hue is not None and raw_sat is not None:
             self._attr_hs_color = (float(raw_hue), round(float(raw_sat) / 10, 1))
 
-        # Derive active color mode
         if (ColorMode.HS in self._attr_supported_color_modes
                 and self._attr_hs_color and self._attr_hs_color[1] > 0):
             self._attr_color_mode = ColorMode.HS
@@ -214,7 +179,7 @@ class CozyLifeLight(LightEntity):
             self._attr_color_mode = ColorMode.BRIGHTNESS
 
     def turn_on(self, **kwargs: Any) -> None:
-        dp: dict = {_DP_SWITCH: True}
+        dp: dict = {_DP_SWITCH: 1}  # integer 1, not True
 
         if ATTR_BRIGHTNESS in kwargs:
             dp[_DP_BRIGHT] = _br_ha_to_raw(kwargs[ATTR_BRIGHTNESS])
@@ -236,6 +201,6 @@ class CozyLifeLight(LightEntity):
 
     def turn_off(self, **kwargs: Any) -> None:
         try:
-            self._device.apply_state({_DP_SWITCH: False})
+            self._device.apply_state({_DP_SWITCH: 0})  # integer 0, not False
         except Exception as exc:
             _LOGGER.error("CozyLife light %s turn_off error: %s", self._attr_unique_id, exc)

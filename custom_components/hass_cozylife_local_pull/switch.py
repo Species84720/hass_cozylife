@@ -1,9 +1,7 @@
-"""CozyLife switch / plug platform - updated for HA 2026.3.
+"""CozyLife switch / plug platform.
 
-Replaces the original switch.py entirely.
-
-CozyLife dpid reference:
-  1 : on/off  bool
+Protocol note: the device returns state as integers (0/1), not booleans.
+CMD_SET payload uses string keys: {"1": 1} to turn on, {"1": 0} to turn off.
 """
 from __future__ import annotations
 
@@ -22,17 +20,12 @@ DOMAIN = "hass_cozylife_local_pull"
 _DP_SWITCH = "1"
 
 
-# ---------------------------------------------------------------------------
-# Platform setup
-# ---------------------------------------------------------------------------
-
 async def async_setup_platform(
     hass: HomeAssistant,
     config: dict,
     async_add_entities: AddEntitiesCallback,
     discovery_info: dict | None = None,
 ) -> None:
-    """Legacy yaml setup."""
     _setup_switches(hass, async_add_entities)
 
 
@@ -41,43 +34,29 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Config-entry setup - links entities to the integration card."""
     _setup_switches(hass, async_add_entities)
 
 
 def _is_switch(device) -> bool:
-    """Return True if this device should be handled as a switch.
-
-    Devices without brightness dpid 4 are switches/plugs.
-    Falls back to model name heuristics when dpid info is missing.
-    """
     dpids: list[int] = list(getattr(device, "dpid", None) or [])
     if dpids:
-        return 4 not in dpids  # no brightness = not a light = switch
+        return 4 not in dpids
     dmn: str = (getattr(device, "dmn", "") or "").lower()
-    # If it looks like a light, let light.py handle it
     if any(k in dmn for k in ("light", "bulb", "lamp", "strip", "led")):
         return False
-    return True  # Default: treat unknown non-light devices as switches
+    return True
 
 
-def _setup_switches(
-    hass: HomeAssistant, async_add_entities: AddEntitiesCallback
-) -> None:
+def _setup_switches(hass: HomeAssistant, async_add_entities: AddEntitiesCallback) -> None:
     devices: list = hass.data.get(DOMAIN, {}).get("devices", [])
     if not devices:
         _LOGGER.debug("CozyLife switch: no devices in hass.data yet")
         return
-
     entities = [CozyLifeSwitch(d) for d in devices if _is_switch(d)]
     _LOGGER.debug("CozyLife switch: registering %d entity/entities", len(entities))
     if entities:
         async_add_entities(entities, update_before_add=True)
 
-
-# ---------------------------------------------------------------------------
-# Entity
-# ---------------------------------------------------------------------------
 
 class CozyLifeSwitch(SwitchEntity):
     """One CozyLife switch or smart plug."""
@@ -107,20 +86,23 @@ class CozyLifeSwitch(SwitchEntity):
             state: dict = self._device.query() or {}
             raw = state.get(_DP_SWITCH)
             if raw is not None:
-                self._attr_is_on = bool(raw)
+                # Device returns 0/1 integers, not booleans
+                self._attr_is_on = bool(int(raw))
         except Exception as exc:
             _LOGGER.warning("CozyLife switch %s update error: %s", self._attr_unique_id, exc)
 
     def turn_on(self, **kwargs: Any) -> None:
         try:
-            self._device.apply_state({_DP_SWITCH: True})
+            # Use integer 1, not True - device expects int
+            self._device.apply_state({_DP_SWITCH: 1})
             self._attr_is_on = True
         except Exception as exc:
             _LOGGER.error("CozyLife switch %s turn_on error: %s", self._attr_unique_id, exc)
 
     def turn_off(self, **kwargs: Any) -> None:
         try:
-            self._device.apply_state({_DP_SWITCH: False})
+            # Use integer 0, not False
+            self._device.apply_state({_DP_SWITCH: 0})
             self._attr_is_on = False
         except Exception as exc:
             _LOGGER.error("CozyLife switch %s turn_off error: %s", self._attr_unique_id, exc)
