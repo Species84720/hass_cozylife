@@ -4,9 +4,7 @@ Supports both:
   - UI-based setup via config_flow (recommended)
   - Legacy configuration.yaml for backward compatibility
 
-IMPORTANT: This file requires cozylife_device.py from the ORIGINAL repo to
-remain in the same folder. We do NOT replace that file - it contains the
-CozyLifeDevice class with the TCP socket logic for communicating with devices.
+cozylife_device.py is now bundled with this integration - no external files needed.
 """
 from __future__ import annotations
 
@@ -15,7 +13,7 @@ import logging
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry, ConfigEntryNotReady
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.discovery import async_load_platform
@@ -52,32 +50,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up from configuration.yaml (legacy path)."""
     if DOMAIN not in config:
         return True
-
     if hass.config_entries.async_entries(DOMAIN):
-        _LOGGER.debug(
-            "CozyLife: config entry exists - skipping configuration.yaml setup"
-        )
+        _LOGGER.debug("CozyLife: config entry exists - skipping yaml setup")
         return True
 
     conf = config[DOMAIN]
-    lang = conf.get(CONF_LANG, "en")
-    ip_list = conf.get(CONF_IPS, [])
-
-    try:
-        await _async_build_devices(hass, ip_list, lang)
-    except ImportError as exc:
-        _LOGGER.error(
-            "CozyLife: cannot import CozyLifeDevice - make sure cozylife_device.py "
-            "from the original repository is present in the custom_components/"
-            "hass_cozylife_local_pull/ folder. Error: %s", exc
-        )
-        return False
+    await _async_build_devices(hass, conf.get(CONF_IPS, []), conf.get(CONF_LANG, "en"))
 
     for platform in PLATFORMS:
         hass.async_create_task(
             async_load_platform(hass, platform, DOMAIN, {}, config)
         )
-
     return True
 
 
@@ -90,19 +73,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     lang: str = entry.data.get(CONF_LANG, "en")
     ip_list: list[str] = entry.data.get(CONF_IPS, [])
 
-    _LOGGER.info(
-        "CozyLife: setting up entry - lang=%s, ips=%s", lang, ip_list
-    )
+    _LOGGER.info("CozyLife: setting up entry - lang=%s, ips=%s", lang, ip_list)
 
-    try:
-        await _async_build_devices(hass, ip_list, lang)
-    except ImportError as exc:
-        raise ConfigEntryNotReady(
-            f"CozyLife: cannot import CozyLifeDevice. "
-            f"Make sure cozylife_device.py from the original repository is "
-            f"present in custom_components/hass_cozylife_local_pull/. "
-            f"Error: {exc}"
-        ) from exc
+    await _async_build_devices(hass, ip_list, lang)
 
     _LOGGER.info(
         "CozyLife: %d device(s) ready, forwarding to platforms",
@@ -110,7 +83,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
@@ -135,14 +107,12 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 async def _async_build_devices(
     hass: HomeAssistant, ip_list: list[str], lang: str
 ) -> None:
-    """Create CozyLifeDevice objects for every IP and cache in hass.data.
+    """Connect to each IP, create CozyLifeDevice objects, store in hass.data.
 
-    Raises ImportError if cozylife_device.py is missing (caller handles it).
-    Devices that fail to respond are logged but still added so they can
-    recover when they come back online.
+    All blocking TCP work runs in the executor. Devices that fail to respond
+    are still added to the list so they recover when they come back online.
     """
-    # Import here so a missing file raises ImportError the caller can handle
-    from .cozylife_device import CozyLifeDevice  # noqa: PLC0415
+    from .cozylife_device import CozyLifeDevice
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][CONF_LANG] = lang
@@ -151,26 +121,26 @@ async def _async_build_devices(
 
     if not ip_list:
         _LOGGER.warning(
-            "CozyLife: no IP addresses configured - no devices will appear. "
-            "Go to Settings -> Devices & Services -> CozyLife -> Configure "
-            "to add device IPs."
+            "CozyLife: no IP addresses configured. "
+            "Go to Settings -> Devices & Services -> CozyLife -> Configure to add IPs."
         )
         return
 
     async def _init_one(ip: str) -> None:
+        device = CozyLifeDevice(ip)
         try:
-            device = CozyLifeDevice(ip)
             await hass.async_add_executor_job(device.query)
-            hass.data[DOMAIN]["devices"].append(device)
-            _LOGGER.debug(
-                "CozyLife: initialised device at %s  did=%s dpid=%s",
-                ip,
-                getattr(device, "did", "?"),
-                getattr(device, "dpid", "?"),
+            _LOGGER.info(
+                "CozyLife: connected %s  did=%s  dmn=%s  dpid=%s",
+                ip, device.did or "?", device.dmn or "?", device.dpid or "?",
             )
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.error(
-                "CozyLife: failed to initialise device at %s: %s", ip, exc
+            _LOGGER.warning(
+                "CozyLife: could not reach %s (%s) - adding anyway, will retry on update",
+                ip, exc,
             )
+        # Always append so the entity is registered and shows unavailable
+        # rather than silently missing from the UI
+        hass.data[DOMAIN]["devices"].append(device)
 
     await asyncio.gather(*[_init_one(ip) for ip in ip_list])
